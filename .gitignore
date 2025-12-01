@@ -1,0 +1,17 @@
+# OS / editor junk
+.DS_Store
+Thumbs.db
+
+# IDE / editor configs
+.vscode/
+.idea/
+
+# Environment & secrets
+.env
+.env.*
+*.env
+
+# Logs / tmp
+*.log
+*.tmp
+*.swp
