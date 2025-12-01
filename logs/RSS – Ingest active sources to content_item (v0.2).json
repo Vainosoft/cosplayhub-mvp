@@ -1,0 +1,170 @@
+{
+  "workflows": [
+    {
+      "workflow_name": "RSS – Ingest active sources to content_item (v0.2)",
+      "purpose": [
+        "Периодически читать все активные RSS-источники из таблицы source",
+        "Нормализовать RSS-items, вызвать LLM для краткого summary",
+        "Upsert-ить данные в public.content_item со статусом new/ready_for_review"
+      ],
+      "entry": "schedule_trigger_ingest",
+      "nodes": {
+        "schedule_trigger_ingest": {
+          "type": "schedule_trigger",
+          "description": "Запускается каждые N минут (например, каждые 15 минут).",
+          "config": {
+            "mode": "interval",
+            "every": "N minutes"
+          },
+          "output": ["get_active_sources"]
+        },
+
+        "get_active_sources": {
+          "type": "postgres_execute_query",
+          "description": "Берём список активных RSS источников.",
+          "connection": "Postgres account",
+          "sql": "SELECT id, source_key, name, url, default_language, default_geo_tags, default_topic_tags\nFROM public.source\nWHERE type = 'rss' AND is_active = true;",
+          "output": ["loop_over_sources"]
+        },
+
+        "loop_over_sources": {
+          "type": "split_in_batches",
+          "description": "Перебирает источники по одному (или небольшими батчами).",
+          "config": {
+            "batchSize": 1
+          },
+          "output": ["rss_read_ingest"]
+        },
+
+        "rss_read_ingest": {
+          "type": "rss_feed_read",
+          "description": "Читает RSS по текущему source.url и возвращает items.",
+          "config": {
+            "url_expression": "{{ $json[\"url\"] }}",
+            "options": {
+              "parseFull": true
+            }
+          },
+          "output": ["attach_source_info"]
+        },
+
+        "attach_source_info": {
+          "type": "code",
+          "language": "javascript",
+          "description": "Добавляет к каждому RSS item информацию об источнике (source_id, source_key, дефолтные теги).",
+          "code": "const source = $items(\"loop_over_sources\")[0].json;\n\nreturn $input.all().map(item => {\n  const rss = item.json;\n  return {\n    json: {\n      source_id: source.id,\n      source_key: source.source_key,\n      default_language: source.default_language || 'en',\n      default_geo_tags: source.default_geo_tags || [],\n      default_topic_tags: source.default_topic_tags || [],\n      rss: rss\n    }\n  };\n});",
+          "output": ["build_llm_input"]
+        },
+
+        "build_llm_input": {
+          "type": "code",
+          "language": "javascript",
+          "description": "Готовит текст и картинку для LLM на основе RSS item.",
+          "code": "return $input.all().map(item => {\n  const data = item.json;\n  const rss = data.rss;\n\n  // вытаскиваем текст и картинку (упрощённо)\n  const title = rss.title || '';\n  const description = (rss.contentSnippet || rss.content || '').toString();\n  let imageUrl = null;\n  if (rss.enclosure && rss.enclosure.url) imageUrl = rss.enclosure.url;\n\n  // простой парс <img src> из HTML\n  if (!imageUrl && typeof rss.content === 'string') {\n    const m = rss.content.match(/<img[^>]+src=[\"']([^\"']+)[\"']/i);\n    if (m) imageUrl = m[1];\n  }\n\n  const prompt = `${title}\\n\\n${description}`.slice(0, 4000);\n\n  return {\n    json: {\n      ...data,\n      title,\n      description,\n      image_url: imageUrl,\n      llm_prompt: prompt\n    }\n  };\n});",
+          "output": ["openai_summary"]
+        },
+
+        "openai_summary": {
+          "type": "openai_chat_model",
+          "description": "Короткий summary на английском (2–3 предложения).",
+          "config": {
+            "model": "gpt-4.1-mini (или аналогичный)",
+            "system_message": "You are a content summarizer for a cosplay news channel. Summarize the article in 2-3 short sentences in English.",
+            "user_message_expression": "{{ $json[\"llm_prompt\"] }}"
+          },
+          "output": ["map_to_content_item"]
+        },
+
+        "map_to_content_item": {
+          "type": "code",
+          "language": "javascript",
+          "description": "Собирает финальную структуру строки для таблицы public.content_item.",
+          "code": "return $input.all().map(item => {\n  const data = item.json;\n  const rss = data.rss;\n  const llm = item.$node[\"openai_summary\"].json; // summary в llm.text или аналогичном поле\n\n  const summary = llm.text || llm.summary || data.description || '';\n\n  return {\n    json: {\n      source_id: data.source_id,\n      external_id: rss.guid || null,\n      title: data.title,\n      summary,\n      original_url: rss.link || null,\n      image_url: data.image_url || null,\n      content_type: 'tutorial',\n      language: data.default_language || 'en',\n      geo_tags: data.default_geo_tags || [],\n      topic_tags: data.default_topic_tags || [],\n      published_at: rss.isoDate || rss.pubDate || null,\n      status: 'new',\n      posted_to_channel: false,\n      is_manual: false,\n      is_sponsored: false,\n      raw_payload_ref: null,\n      source_metadata: {\n        rss\n      }\n    }\n  };\n});",
+          "output": ["upsert_content_item"]
+        },
+
+        "upsert_content_item": {
+          "type": "postgres_execute_query",
+          "description": "Upsert в public.content_item на основе уникального ключа (source_id + original_url или external_id).",
+          "connection": "Postgres account",
+          "sql_summary": "INSERT INTO public.content_item (...) VALUES (...) ON CONFLICT (source_id, original_url) DO UPDATE SET ...; заполняет ingested_at=NOW(), updated_at=NOW()."
+        }
+      },
+      "edges": [
+        ["schedule_trigger_ingest", "get_active_sources"],
+        ["get_active_sources", "loop_over_sources"],
+        ["loop_over_sources", "rss_read_ingest"],
+        ["rss_read_ingest", "attach_source_info"],
+        ["attach_source_info", "build_llm_input"],
+        ["build_llm_input", "openai_summary"],
+        ["openai_summary", "map_to_content_item"],
+        ["map_to_content_item", "upsert_content_item"]
+      ]
+    },
+
+    {
+      "workflow_name": "Content – Post approved content_item to Telegram channel",
+      "purpose": [
+        "Выбрать approved, ещё не опубликованные записи из content_item",
+        "Сформировать сообщение и отправить в основной Telegram-канал CosplayHub",
+        "Отметить записи как posted в БД"
+      ],
+      "entry": "schedule_trigger_post",
+      "nodes": {
+        "schedule_trigger_post": {
+          "type": "schedule_trigger",
+          "description": "Периодически запускает рассылку (например, раз в несколько минут или часов).",
+          "config": {
+            "mode": "interval",
+            "every": "N minutes/hours"
+          },
+          "output": ["select_approved_items"]
+        },
+
+        "select_approved_items": {
+          "type": "postgres_execute_query",
+          "description": "Берём контент, который прошёл ревью и ещё не публиковался.",
+          "connection": "Postgres account",
+          "sql": "SELECT id, title, summary, original_url, image_url, published_at\nFROM public.content_item\nWHERE status = 'approved'::content_status\n  AND posted_to_channel = false\nORDER BY updated_at ASC\nLIMIT 20;",
+          "output": ["loop_over_items_post"]
+        },
+
+        "loop_over_items_post": {
+          "type": "split_in_batches",
+          "description": "Итерируем по контенту для постинга, по одному item.",
+          "config": {
+            "batchSize": 1
+          },
+          "output": ["send_to_channel"]
+        },
+
+        "send_to_channel": {
+          "type": "telegram_send_message",
+          "description": "Публикует пост в основной Telegram-канал CosplayHub (с текстом и, при наличии, картинкой).",
+          "config": {
+            "bot_credentials": "Telegram public channel bot",
+            "chat_id": "@CosplayHubChannel",
+            "parse_mode": "Markdown",
+            "text_expression": "🎭 *{{ $json[\"title\"] }}*\\n\\n{{ $json[\"summary\"] }}\\n\\n📎 {{ $json[\"original_url\"] }}",
+            "optional_photo_expression": "{{ $json[\"image_url\"] || '' }}"
+          },
+          "output": ["mark_posted"]
+        },
+
+        "mark_posted": {
+          "type": "postgres_execute_query",
+          "description": "Помечает контент как опубликованный.",
+          "connection": "Postgres account",
+          "sql": "UPDATE public.content_item\nSET status = 'posted'::content_status,\n    posted_to_channel = true,\n    posted_at = NOW(),\n    posted_message_id = $2\nWHERE id = $1::bigint;",
+          "query_parameters_expression": "{{ $json[\"id\"] }},{{ $node[\"send_to_channel\"].json[\"result\"][\"message_id\"] }}"
+        }
+      },
+      "edges": [
+        ["schedule_trigger_post", "select_approved_items"],
+        ["select_approved_items", "loop_over_items_post"],
+        ["loop_over_items_post", "send_to_channel"],
+        ["send_to_channel", "mark_posted"]
+      ]
+    }
+  ]
+}
