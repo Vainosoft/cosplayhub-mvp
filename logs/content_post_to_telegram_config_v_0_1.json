@@ -1,0 +1,92 @@
+{
+  "workflow": {
+    "name": "Content – Post approved content_item to Telegram channel",
+    "description": "Takes approved, not-yet-posted content_item rows and posts them to the public CosplayHub channel, then marks them as posted.",
+    "trigger_type": "schedule",
+    "nodes": [
+      {
+        "id": "schedule_trigger_post",
+        "name": "Schedule Trigger",
+        "type": "scheduleTrigger",
+        "description": "Runs periodically (e.g. every 10–15 minutes) to check for items ready to post.",
+        "config": {
+          "mode": "every_X_minutes",
+          "interval_minutes": 10
+        },
+        "outputs": ["select_approved_items"]
+      },
+      {
+        "id": "select_approved_items",
+        "name": "Select approved items",
+        "type": "postgres",
+        "description": "Selects content_item rows that are approved and not yet posted to the channel.",
+        "sql": [
+          "SELECT",
+          "  id,",
+          "  title,",
+          "  original_url,",
+          "  content_type,",
+          "  status,",
+          "  published_at,",
+          "  updated_at",
+          "FROM public.content_item",
+          "WHERE status = 'approved'",
+          "  AND posted_to_channel = false",
+          "ORDER BY updated_at ASC",
+          "LIMIT 10;"
+        ],
+        "outputs": ["loop_over_items_post"]
+      },
+      {
+        "id": "loop_over_items_post",
+        "name": "Loop Over Items",
+        "type": "splitInBatches",
+        "description": "Iterates through selected content_item rows one by one.",
+        "config": {
+          "batchSize": 1
+        },
+        "outputs": ["send_to_channel"]
+      },
+      {
+        "id": "send_to_channel",
+        "name": "Send to Telegram channel",
+        "type": "telegramSendMessage",
+        "description": "Formats message text and posts each content_item to the public CosplayHub channel.",
+        "config": {
+          "credential": "Telegram account (channel bot)",
+          "chat_id": "<COSPLAYHUB_CHANNEL_ID>",
+          "parse_mode": "MarkdownV2",
+          "disable_web_page_preview": false,
+          "include_n8n_footer": false,
+          "text_expression": [
+            "🎭 {{$json[\"title\"] || '(no title)'}}\n",
+            "📅 {{$json[\"published_at\"] || '—'}}\n\n",
+            "{{$json[\"original_url\"] || ''}}"
+          ]
+        },
+        "outputs": ["mark_posted"]
+      },
+      {
+        "id": "mark_posted",
+        "name": "Mark as posted",
+        "type": "postgres",
+        "description": "Updates content_item row after successful post to Telegram channel.",
+        "sql": [
+          "UPDATE public.content_item",
+          "SET",
+          "  status = 'posted',",
+          "  posted_to_channel = true,",
+          "  posted_at = NOW()",
+          "WHERE id = {{{{$json[\"id\"]}}}};"
+        ],
+        "outputs": []
+      }
+    ],
+    "edges": [
+      ["schedule_trigger_post", "select_approved_items"],
+      ["select_approved_items", "loop_over_items_post"],
+      ["loop_over_items_post", "send_to_channel"],
+      ["send_to_channel", "mark_posted"]
+    ]
+  }
+}
